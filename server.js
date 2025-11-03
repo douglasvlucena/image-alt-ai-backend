@@ -4,6 +4,7 @@ import sharp from "sharp";
 import dotenv from "dotenv";
 import OpenAI from "openai";
 import pkg from "pg";
+import crypto from "crypto";
 
 dotenv.config();
 
@@ -18,25 +19,43 @@ app.use(express.urlencoded({ extended: true, limit: "15mb" }));
 const PORT = process.env.PORT || 3000;
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || "admin-default";
 
+// 👇 coloca isso no Render
+// FREEMIUS_WEBHOOK_SECRET=qualquer-string-grande
+const FREEMIUS_WEBHOOK_SECRET =
+  process.env.FREEMIUS_WEBHOOK_SECRET || "freemius-secret-dev";
+
+// 🔢 mapa oficial dos planos
+const PLAN_QUOTAS = {
+  starter: 300,
+  pro: 1500,
+  enterprise: 5000,
+};
+
 // conexão com Postgres (Render)
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false },
 });
 
-// cria tabela se não existir
+// cria tabela se não existir e garante colunas novas
 async function ensureTable() {
-  const sql = `
+  const baseTable = `
     CREATE TABLE IF NOT EXISTS licenses (
       license_key TEXT PRIMARY KEY,
       plan TEXT NOT NULL DEFAULT 'starter',
-      monthly_quota INTEGER NOT NULL DEFAULT 100,
+      monthly_quota INTEGER NOT NULL DEFAULT 300,
       used_this_month INTEGER NOT NULL DEFAULT 0,
       site_url TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      last_reset_at TIMESTAMPTZ
     );
   `;
-  await pool.query(sql);
+  await pool.query(baseTable);
+
+  // se alguém criou antes sem last_reset_at
+  await pool.query(
+    "ALTER TABLE licenses ADD COLUMN IF NOT EXISTS last_reset_at TIMESTAMPTZ"
+  );
 }
 
 ensureTable()
@@ -62,7 +81,10 @@ async function resizeFromBuffer(buffer) {
   return resized;
 }
 
-async function generateAltFromImage(imageBuffer, template = "Descrição: {description}") {
+async function generateAltFromImage(
+  imageBuffer,
+  template = "Descrição: {description}"
+) {
   const base64Image = imageBuffer.toString("base64");
 
   const completion = await openai.chat.completions.create({
@@ -70,12 +92,16 @@ async function generateAltFromImage(imageBuffer, template = "Descrição: {descr
     messages: [
       {
         role: "system",
-        content: "Você gera descrições curtas de imagem para atributo alt, em português, focadas em SEO.",
+        content:
+          "Você gera descrições curtas de imagem para atributo alt, em português, focadas em SEO.",
       },
       {
         role: "user",
         content: [
-          { type: "text", text: "Descreva a imagem em até 120 caracteres, dizendo o que aparece." },
+          {
+            type: "text",
+            text: "Descreva a imagem em até 120 caracteres, dizendo o que aparece.",
+          },
           {
             type: "image_url",
             image_url: {
@@ -93,13 +119,79 @@ async function generateAltFromImage(imageBuffer, template = "Descrição: {descr
   return { alt };
 }
 
+/**
+ * Aplica as regras do plano:
+ * - força nome em minúsculo
+ * - se for starter/pro/enterprise, sobrescreve a quota pelo valor oficial
+ * - faz reset mensal se mudou o mês
+ */
+async function normalizeLicenseRow(row) {
+  if (!row) return null;
+
+  let {
+    plan,
+    monthly_quota,
+    used_this_month,
+    last_reset_at,
+    license_key,
+  } = row;
+
+  const now = new Date();
+  const planLower = (plan || "starter").toLowerCase();
+
+  // quota oficial
+  const officialQuota =
+    PLAN_QUOTAS[planLower] !== undefined
+      ? PLAN_QUOTAS[planLower]
+      : monthly_quota;
+
+  let finalUsed = used_this_month;
+  let needReset = false;
+
+  if (last_reset_at) {
+    const last = new Date(last_reset_at);
+    const sameMonth =
+      last.getUTCFullYear() === now.getUTCFullYear() &&
+      last.getUTCMonth() === now.getUTCMonth();
+    if (!sameMonth) {
+      needReset = true;
+    }
+  } else {
+    needReset = true;
+  }
+
+  if (needReset) {
+    finalUsed = 0;
+    await pool.query(
+      "UPDATE licenses SET used_this_month = 0, last_reset_at = $2 WHERE license_key = $1",
+      [license_key, now.toISOString()]
+    );
+  }
+
+  // se o plano é starter/pro/enterprise e quota tá diferente do oficial → corrige
+  if (officialQuota !== monthly_quota) {
+    await pool.query(
+      "UPDATE licenses SET monthly_quota = $2 WHERE license_key = $1",
+      [license_key, officialQuota]
+    );
+  }
+
+  return {
+    ...row,
+    plan: planLower,
+    monthly_quota: officialQuota,
+    used_this_month: finalUsed,
+  };
+}
+
 // util: pega licença no banco
 async function getLicenseFromDB(license_key) {
   const { rows } = await pool.query(
-    "SELECT license_key, plan, monthly_quota, used_this_month, site_url FROM licenses WHERE license_key = $1",
+    "SELECT license_key, plan, monthly_quota, used_this_month, site_url, created_at, last_reset_at FROM licenses WHERE license_key = $1",
     [license_key]
   );
-  return rows[0] || null;
+  const raw = rows[0] || null;
+  return await normalizeLicenseRow(raw);
 }
 
 // util: atualiza uso
@@ -111,6 +203,11 @@ async function incrementUsage(license_key) {
 }
 
 // ------------------ ROTAS ------------------ //
+
+// healthcheck pro Render
+app.get("/", (req, res) => {
+  res.json({ ok: true, message: "WP Image Alt AI backend up" });
+});
 
 // WP checa licença / uso
 app.post("/usage", async (req, res) => {
@@ -134,7 +231,9 @@ app.post("/usage", async (req, res) => {
     });
   } catch (err) {
     console.error("Erro /usage:", err);
-    return res.status(500).json({ success: false, message: "Erro no servidor." });
+    return res
+      .status(500)
+      .json({ success: false, message: "Erro no servidor." });
   }
 });
 
@@ -143,7 +242,9 @@ app.post("/optimize/image", async (req, res) => {
   const { license_key, image_url, image_base64, template } = req.body || {};
 
   if (!license_key) {
-    return res.status(400).json({ success: false, message: "license_key obrigatória" });
+    return res
+      .status(400)
+      .json({ success: false, message: "license_key obrigatória" });
   }
 
   try {
@@ -152,29 +253,33 @@ app.post("/optimize/image", async (req, res) => {
       return res.json({ success: false, message: "Licença inválida" });
     }
 
+    // ⚠️ checa limite
     if (lic.used_this_month >= lic.monthly_quota) {
-      return res.json({ success: false, message: "Limite do plano atingido" });
+      return res.json({
+        success: false,
+        message: "Limite do plano atingido",
+      });
     }
 
     let imgBuffer;
 
     if (image_base64) {
-      // veio direto do WP
       const rawBuffer = Buffer.from(image_base64, "base64");
       imgBuffer = await resizeFromBuffer(rawBuffer);
     } else if (image_url) {
-      // fallback: do jeito antigo
       imgBuffer = await downloadAndResize(image_url);
     } else {
-      return res.status(400).json({ success: false, message: "Nenhuma imagem recebida." });
+      return res
+        .status(400)
+        .json({ success: false, message: "Nenhuma imagem recebida." });
     }
 
-    const { alt } = await generateAltFromImage(imgBuffer, template || "Descrição: {description}");
+    const { alt } = await generateAltFromImage(
+      imgBuffer,
+      template || "Descrição: {description}"
+    );
 
-    // marca uso
     await incrementUsage(license_key);
-
-    // pega de novo o uso atualizado
     const licUpdated = await getLicenseFromDB(license_key);
 
     return res.json({
@@ -189,20 +294,28 @@ app.post("/optimize/image", async (req, res) => {
     });
   } catch (err) {
     console.error("Erro /optimize/image:", err);
-    return res.status(500).json({ success: false, message: "Erro ao processar imagem" });
+    return res
+      .status(500)
+      .json({ success: false, message: "Erro ao processar imagem" });
   }
 });
 
-// ADMIN: criar licença
+// ------------------ ADMIN ------------------ //
+
+// criar licença manualmente (pra teste)
 app.post("/admin/create-license", async (req, res) => {
-  const { admin_token, license_key, plan, monthly_quota, site_url } = req.body || {};
+  const { admin_token, license_key, plan, site_url } = req.body || {};
 
   if (!admin_token || admin_token !== ADMIN_TOKEN) {
-    return res.status(401).json({ success: false, message: "Token de admin inválido." });
+    return res
+      .status(401)
+      .json({ success: false, message: "Token de admin inválido." });
   }
 
   if (!license_key) {
-    return res.status(400).json({ success: false, message: "license_key é obrigatória." });
+    return res
+      .status(400)
+      .json({ success: false, message: "license_key é obrigatória." });
   }
 
   try {
@@ -211,9 +324,20 @@ app.post("/admin/create-license", async (req, res) => {
       return res.json({ success: false, message: "Essa licença já existe." });
     }
 
+    const planLower = (plan || "starter").toLowerCase();
+    const quota =
+      PLAN_QUOTAS[planLower] !== undefined ? PLAN_QUOTAS[planLower] : 300;
+
     await pool.query(
-      "INSERT INTO licenses (license_key, plan, monthly_quota, used_this_month, site_url) VALUES ($1,$2,$3,$4,$5)",
-      [license_key, plan || "starter", monthly_quota ? Number(monthly_quota) : 100, 0, site_url || null]
+      "INSERT INTO licenses (license_key, plan, monthly_quota, used_this_month, site_url, last_reset_at) VALUES ($1,$2,$3,$4,$5,$6)",
+      [
+        license_key,
+        planLower,
+        quota,
+        0,
+        site_url || null,
+        new Date().toISOString(),
+      ]
     );
 
     const lic = await getLicenseFromDB(license_key);
@@ -225,34 +349,55 @@ app.post("/admin/create-license", async (req, res) => {
     });
   } catch (err) {
     console.error("Erro /admin/create-license:", err);
-    return res.status(500).json({ success: false, message: "Erro ao criar licença." });
+    return res
+      .status(500)
+      .json({ success: false, message: "Erro ao criar licença." });
   }
 });
 
-// ADMIN: listar
+// listar
 app.post("/admin/list-licenses", async (req, res) => {
   const { admin_token } = req.body || {};
   if (!admin_token || admin_token !== ADMIN_TOKEN) {
-    return res.status(401).json({ success: false, message: "Token de admin inválido." });
+    return res
+      .status(401)
+      .json({ success: false, message: "Token de admin inválido." });
   }
 
-  const { rows } = await pool.query("SELECT * FROM licenses ORDER BY created_at DESC");
-  return res.json({ success: true, licenses: rows });
+  const { rows } = await pool.query(
+    "SELECT * FROM licenses ORDER BY created_at DESC"
+  );
+
+  const normalized = [];
+  for (const row of rows) {
+    normalized.push(await normalizeLicenseRow(row));
+  }
+
+  return res.json({ success: true, licenses: normalized });
 });
 
-// ADMIN: reset
+// reset
 app.post("/admin/reset-license", async (req, res) => {
   const { admin_token, license_key } = req.body || {};
 
   if (!admin_token || admin_token !== ADMIN_TOKEN) {
-    return res.status(401).json({ success: false, message: "Token de admin inválido." });
+    return res
+      .status(401)
+      .json({ success: false, message: "Token de admin inválido." });
   }
 
   if (!license_key) {
-    return res.status(400).json({ success: false, message: "license_key é obrigatória." });
+    return res
+      .status(400)
+      .json({ success: false, message: "license_key é obrigatória." });
   }
 
-  await pool.query("UPDATE licenses SET used_this_month = 0 WHERE license_key = $1", [license_key]);
+  const now = new Date().toISOString();
+
+  await pool.query(
+    "UPDATE licenses SET used_this_month = 0, last_reset_at = $2 WHERE license_key = $1",
+    [license_key, now]
+  );
 
   const lic = await getLicenseFromDB(license_key);
 
@@ -262,6 +407,105 @@ app.post("/admin/reset-license", async (req, res) => {
     license: lic,
   });
 });
+
+// ------------------ FREEMIUS WEBHOOK ------------------ //
+// objetivo: quando alguém comprar / ativar no Freemius, ele manda pra cá
+// e a gente cria/atualiza a licença no Postgres
+
+function verifyFreemiusSignature(rawBody, signature) {
+  if (!signature) return false;
+  const hmac = crypto
+    .createHmac("sha256", FREEMIUS_WEBHOOK_SECRET)
+    .update(rawBody, "utf8")
+    .digest("hex");
+  return hmac === signature;
+}
+
+// precisamos do raw body pra validar a assinatura
+app.post(
+  "/freemius/webhook",
+  express.raw({ type: "*/*", limit: "2mb" }),
+  async (req, res) => {
+    const sig = req.header("x-freemius-signature");
+    const raw = req.body.toString("utf8");
+
+    if (!verifyFreemiusSignature(raw, sig)) {
+      return res.status(401).json({ success: false, message: "assinatura inválida" });
+    }
+
+    let payload;
+    try {
+      payload = JSON.parse(raw);
+    } catch (e) {
+      return res.status(400).json({ success: false, message: "json inválido" });
+    }
+
+    // Freemius manda muitas chaves; vamos pegar o que interessa
+    // tentar achar a licença
+    const licenseObj =
+      payload.license ||
+      payload.subscription?.license ||
+      payload.install?.license ||
+      null;
+
+    // tentar achar o plano
+    const planObj = payload.plan || payload.subscription?.plan || null;
+
+    const licenseKey =
+      licenseObj?.secret_key ||
+      licenseObj?.key ||
+      payload.secret_key ||
+      null;
+
+    if (!licenseKey) {
+      return res
+        .status(400)
+        .json({ success: false, message: "sem licença no payload" });
+    }
+
+    // nome do plano (Starter, Pro, Enterprise)
+    const planNameRaw =
+      planObj?.title ||
+      planObj?.name ||
+      payload.plan_title ||
+      payload.plan_name ||
+      "starter";
+
+    const planLower = planNameRaw.toLowerCase();
+
+    let selectedPlan = "starter";
+    if (planLower.includes("enterprise")) {
+      selectedPlan = "enterprise";
+    } else if (planLower.includes("pro")) {
+      selectedPlan = "pro";
+    } else {
+      selectedPlan = "starter";
+    }
+
+    const quota = PLAN_QUOTAS[selectedPlan] || 300;
+
+    // upsert no Postgres
+    await pool.query(
+      `
+      INSERT INTO licenses (license_key, plan, monthly_quota, used_this_month, site_url, last_reset_at)
+      VALUES ($1,$2,$3,0,$4,$5)
+      ON CONFLICT (license_key)
+      DO UPDATE SET
+        plan = EXCLUDED.plan,
+        monthly_quota = EXCLUDED.monthly_quota
+    `,
+      [
+        licenseKey,
+        selectedPlan,
+        quota,
+        payload.site?.url || null,
+        new Date().toISOString(),
+      ]
+    );
+
+    return res.json({ success: true });
+  }
+);
 
 app.listen(PORT, () => {
   console.log("🚀 API rodando na porta " + PORT);
